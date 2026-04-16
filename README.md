@@ -272,7 +272,6 @@ aws s3 rm s3://my-bucket/path/myfile.txt \
 ## Limitations
 
 - **No multipart uploads**: Files are uploaded in a single request
-- **No presigned URLs**: Direct authentication required
 - **No versioning**: Files are overwritten in place
 - **No bucket operations**: Bucket must be pre-configured via env var
 - **Single bucket**: One selfhost_s3 instance = one bucket

@@ -133,9 +133,15 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Validate authentication (skip for public requests)
 	if !isPublicRequest {
-		if err := s.auth.ValidateRequest(r); err != nil {
-			log.Printf("Auth error: %v", err)
-			s.sendError(w, http.StatusForbidden, "AccessDenied", err.Error())
+		var authErr error
+		if auth.IsPresignedRequest(r) {
+			authErr = s.auth.ValidatePresignedURL(r)
+		} else {
+			authErr = s.auth.ValidateRequest(r)
+		}
+		if authErr != nil {
+			log.Printf("Auth error: %v", authErr)
+			s.sendError(w, http.StatusForbidden, "AccessDenied", authErr.Error())
 			return
 		}
 	}

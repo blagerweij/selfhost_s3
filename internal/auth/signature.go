@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -259,6 +260,110 @@ func hmacSHA256(key []byte, data string) []byte {
 func hashSHA256(data string) string {
 	h := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(h[:])
+}
+
+// IsPresignedRequest returns true if the request uses pre-signed URL authentication
+// (query parameters instead of Authorization header).
+func IsPresignedRequest(r *http.Request) bool {
+	return r.URL.Query().Get("X-Amz-Algorithm") == "AWS4-HMAC-SHA256"
+}
+
+// ValidatePresignedURL validates an AWS pre-signed URL request.
+// Auth parameters are carried in query params (X-Amz-Algorithm, X-Amz-Credential,
+// X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, X-Amz-Signature).
+func (s *SignatureV4) ValidatePresignedURL(r *http.Request) error {
+	q := r.URL.Query()
+
+	credential := q.Get("X-Amz-Credential")
+	amzDate := q.Get("X-Amz-Date")
+	expiresStr := q.Get("X-Amz-Expires")
+	signedHeadersParam := q.Get("X-Amz-SignedHeaders")
+	signature := q.Get("X-Amz-Signature")
+
+	if credential == "" || amzDate == "" || expiresStr == "" || signedHeadersParam == "" || signature == "" {
+		return fmt.Errorf("missing required pre-signed URL parameters")
+	}
+
+	// Parse and validate credential
+	credParts := strings.Split(credential, "/")
+	if len(credParts) != 5 {
+		return fmt.Errorf("invalid credential format")
+	}
+	if credParts[0] != s.creds.AccessKey {
+		return fmt.Errorf("invalid access key")
+	}
+
+	// Parse request time
+	requestTime, err := time.Parse("20060102T150405Z", amzDate)
+	if err != nil {
+		return fmt.Errorf("invalid X-Amz-Date format: %w", err)
+	}
+
+	// Parse and check expiry
+	expires, err := strconv.ParseInt(expiresStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid X-Amz-Expires: %w", err)
+	}
+	if time.Now().After(requestTime.Add(time.Duration(expires) * time.Second)) {
+		return fmt.Errorf("pre-signed URL has expired")
+	}
+
+	// Compute and compare signature
+	signedHeaders := strings.Split(signedHeadersParam, ";")
+	expectedSig := s.calculatePresignedSignature(r, signedHeaders, amzDate)
+	if !hmac.Equal([]byte(signature), []byte(expectedSig)) {
+		return fmt.Errorf("signature mismatch")
+	}
+
+	return nil
+}
+
+// calculatePresignedSignature computes the expected signature for a pre-signed URL.
+func (s *SignatureV4) calculatePresignedSignature(r *http.Request, signedHeaders []string, amzDate string) string {
+	canonicalRequest := s.createPresignedCanonicalRequest(r, signedHeaders)
+
+	dateStamp := amzDate[:8]
+	scope := fmt.Sprintf("%s/%s/s3/aws4_request", dateStamp, s.creds.Region)
+	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s",
+		amzDate,
+		scope,
+		hashSHA256(canonicalRequest),
+	)
+
+	signingKey := s.deriveSigningKey(dateStamp)
+	return hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
+}
+
+// createPresignedCanonicalRequest builds the canonical request for a pre-signed URL.
+// X-Amz-Signature is excluded from the query string, and the payload hash is
+// always UNSIGNED-PAYLOAD (pre-signed URLs do not sign the body).
+func (s *SignatureV4) createPresignedCanonicalRequest(r *http.Request, signedHeaders []string) string {
+	canonicalURI := r.URL.RawPath
+	if canonicalURI == "" {
+		canonicalURI = r.URL.Path
+		if canonicalURI == "" {
+			canonicalURI = "/"
+		} else {
+			canonicalURI = uriEncodePath(canonicalURI)
+		}
+	}
+
+	// Exclude X-Amz-Signature from the canonical query string
+	query := r.URL.Query()
+	delete(query, "X-Amz-Signature")
+	canonicalQueryString := s.createCanonicalQueryString(query)
+
+	canonicalHeaders := s.createCanonicalHeaders(r, signedHeaders)
+	signedHeadersStr := strings.Join(signedHeaders, ";")
+
+	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
+		r.Method,
+		canonicalURI,
+		canonicalQueryString,
+		canonicalHeaders,
+		signedHeadersStr,
+		"UNSIGNED-PAYLOAD",
+	)
 }
 
 // uriEncodePath encodes a path according to AWS Signature V4 spec

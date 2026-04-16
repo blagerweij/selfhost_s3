@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -364,6 +365,153 @@ func TestHmacSHA256(t *testing.T) {
 	expectedHex := "8b5f48702995c1598c573db1e21866a9b825d4a794d169d7060a03605796360b"
 	if hex.EncodeToString(result) != expectedHex {
 		t.Errorf("expected %s, got %s", expectedHex, hex.EncodeToString(result))
+	}
+}
+
+func TestIsPresignedRequest(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		expected bool
+	}{
+		{
+			name:     "presigned URL",
+			url:      "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20230101T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=abc",
+			expected: true,
+		},
+		{
+			name:     "regular request",
+			url:      "/bucket/key",
+			expected: false,
+		},
+		{
+			name:     "wrong algorithm",
+			url:      "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA1",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.url, nil)
+			if got := IsPresignedRequest(req); got != tt.expected {
+				t.Errorf("IsPresignedRequest() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestValidatePresignedURL_MissingParams(t *testing.T) {
+	sig := NewSignatureV4("access-key", "secret-key", "us-east-1")
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256", nil)
+
+	err := sig.ValidatePresignedURL(req)
+	if err == nil {
+		t.Fatal("expected error for missing parameters")
+	}
+	if !strings.Contains(err.Error(), "missing required") {
+		t.Errorf("expected missing params error, got: %v", err)
+	}
+}
+
+func TestValidatePresignedURL_WrongAccessKey(t *testing.T) {
+	sig := NewSignatureV4("correct-key", "secret-key", "us-east-1")
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	dateStamp := amzDate[:8]
+
+	url := fmt.Sprintf("/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=wrong-key%%2F%s%%2Fus-east-1%%2Fs3%%2Faws4_request&X-Amz-Date=%s&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=abc",
+		dateStamp, amzDate)
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+
+	err := sig.ValidatePresignedURL(req)
+	if err == nil {
+		t.Fatal("expected error for wrong access key")
+	}
+	if !strings.Contains(err.Error(), "invalid access key") {
+		t.Errorf("expected invalid access key error, got: %v", err)
+	}
+}
+
+func TestValidatePresignedURL_Expired(t *testing.T) {
+	sig := NewSignatureV4("access-key", "secret-key", "us-east-1")
+	// 2 hours ago, expired after 3600s (1 hour)
+	oldTime := time.Now().UTC().Add(-2 * time.Hour)
+	amzDate := oldTime.Format("20060102T150405Z")
+	dateStamp := amzDate[:8]
+
+	rawURL := fmt.Sprintf("/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=access-key%%2F%s%%2Fus-east-1%%2Fs3%%2Faws4_request&X-Amz-Date=%s&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=abc",
+		dateStamp, amzDate)
+	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+
+	err := sig.ValidatePresignedURL(req)
+	if err == nil {
+		t.Fatal("expected error for expired URL")
+	}
+	if !strings.Contains(err.Error(), "expired") {
+		t.Errorf("expected expired error, got: %v", err)
+	}
+}
+
+func TestValidatePresignedURL_ValidSignature(t *testing.T) {
+	accessKey := "AKIAIOSFODNN7EXAMPLE"
+	secretKey := "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	region := "us-east-1"
+
+	sig := NewSignatureV4(accessKey, secretKey, region)
+
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	dateStamp := amzDate[:8]
+	expires := "3600"
+	credential := fmt.Sprintf("%s/%s/%s/s3/aws4_request", accessKey, dateStamp, region)
+	signedHeaders := "host"
+
+	// Build the URL without signature first (to compute canonical query string)
+	rawURL := fmt.Sprintf("http://localhost:9000/test-bucket/test-key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=%s&X-Amz-Date=%s&X-Amz-Expires=%s&X-Amz-SignedHeaders=%s",
+		url.QueryEscape(credential), amzDate, expires, signedHeaders)
+
+	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+	req.Host = "localhost:9000"
+
+	// Compute signature via the internal method
+	expectedSig := sig.calculatePresignedSignature(req, []string{signedHeaders}, amzDate)
+
+	// Add signature to URL
+	rawURL += "&X-Amz-Signature=" + expectedSig
+	req = httptest.NewRequest(http.MethodGet, rawURL, nil)
+	req.Host = "localhost:9000"
+
+	err := sig.ValidatePresignedURL(req)
+	if err != nil {
+		t.Errorf("expected valid pre-signed URL to pass, got: %v", err)
+	}
+}
+
+func TestValidatePresignedURL_InvalidSignature(t *testing.T) {
+	accessKey := "access-key"
+	secretKey := "secret-key"
+	region := "us-east-1"
+
+	sig := NewSignatureV4(accessKey, secretKey, region)
+
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	dateStamp := amzDate[:8]
+	credential := fmt.Sprintf("%s/%s/%s/s3/aws4_request", accessKey, dateStamp, region)
+
+	rawURL := fmt.Sprintf("http://localhost:9000/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=%s&X-Amz-Date=%s&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=%s",
+		url.QueryEscape(credential), amzDate,
+		"0000000000000000000000000000000000000000000000000000000000000000")
+	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+	req.Host = "localhost:9000"
+
+	err := sig.ValidatePresignedURL(req)
+	if err == nil {
+		t.Fatal("expected error for invalid signature")
+	}
+	if !strings.Contains(err.Error(), "signature mismatch") {
+		t.Errorf("expected signature mismatch error, got: %v", err)
 	}
 }
 
